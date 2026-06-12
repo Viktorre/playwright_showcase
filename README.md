@@ -1,8 +1,9 @@
 # Agentic RPA browser agent
 
 A small, readable LLM-driven browser agent for learning **agentic RPA**. It
-drives a **visible** Chromium browser to accomplish a goal you describe in plain
-language. Everything lives in one file, `agent.py`, built around the core loop:
+drives a Chromium browser (visible locally, headless on a server) to accomplish
+a goal you describe in plain language. Everything lives in one file, `agent.py`,
+built around the core loop:
 
 ```
 goal -> OBSERVE (read interactive DOM elements)
@@ -21,8 +22,9 @@ written to be read top to bottom.
 | File | Purpose |
 |------|---------|
 | `agent.py` | The whole agent: DOM observation, action tools, the loop. |
-| `.env` | Your `GEMINI_API_KEY` (git-ignored, never committed). |
+| `.env` | Your `GEMINI_API_KEY`, `HEADLESS` flag, etc. (git-ignored, never committed). |
 | `requirements.txt` | Python dependencies. |
+| `terraform/` | Infrastructure-as-code for the EC2 deployment. |
 | `.gitignore` | Keeps secrets and venv out of git. |
 
 ---
@@ -41,9 +43,14 @@ Put your free Google Gemini API key in `.env`:
 
 ```
 GEMINI_API_KEY=your-key-here
+HEADLESS=false
 ```
 
-Get a key at https://aistudio.google.com/apikey
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `GEMINI_API_KEY` | your key | Required. Get one at https://aistudio.google.com/apikey |
+| `HEADLESS` | `true` / `false` | `false` opens a visible browser (local dev), `true` runs headless (server). Defaults to `true`. |
+| `AGENT_MODEL` | model name | Optional. Defaults to `gemini-2.5-flash`. |
 
 ---
 

@@ -442,7 +442,8 @@ def run_agent(first_goal=None, interactive=False):
     )
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)  # visible browser
+        headless = os.getenv("HEADLESS", "true").lower() == "true"
+        browser = p.chromium.launch(headless=headless)
         try:
             page = browser.new_page()
             page.set_viewport_size({"width": 1280, "height": 900})
