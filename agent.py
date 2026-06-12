@@ -238,6 +238,33 @@ Guidelines:
 """
 
 
+# Raised when a model's *daily* free-tier allowance is gone. Retrying is
+# pointless until the quota window resets, so we surface this distinctly
+# instead of pretending the model is merely "busy".
+class DailyQuotaExceeded(RuntimeError):
+    pass
+
+
+def classify_429(error):
+    """Tell a hard daily-quota 429 apart from a soft per-minute one.
+
+    Gemini returns 429 for both "you've used your 20 requests today" and
+    "you're going too fast this minute". They look identical at the status
+    level but the body differs: the daily violation carries a quotaId/metric
+    mentioning *PerDay* (e.g. GenerateRequestsPerDayPerProjectPerModel), while
+    the per-minute one says *PerMinute*. We inspect the text to decide whether
+    retrying could ever succeed.
+
+    Returns 'daily', 'per_minute', or 'unknown'.
+    """
+    text = str(error)
+    if "PerDay" in text or "per_day" in text or "RequestsPerDay" in text:
+        return "daily"
+    if "PerMinute" in text or "per_minute" in text:
+        return "per_minute"
+    return "unknown"
+
+
 def pick_available_model(client):
     """Choose a model for the whole run (we must not switch mid-conversation).
 
@@ -246,23 +273,32 @@ def pick_available_model(client):
 
     Preference order:
       1. a model that answers cleanly (200) right now;
-      2. failing that, a merely rate-limited (429) model — its per-minute cap
-         resets quickly and the in-loop retry will ride it out;
-      3. if everything is hard-down (503), give up with a clear message.
+      2. failing that, a per-minute rate-limited (429) model — that cap resets
+         in seconds and the in-loop retry will ride it out;
+      3. if everything is busy (503), give up;
+      4. if every model is out of its DAILY quota, say so plainly — waiting a
+         minute won't help, so we don't pretend it will.
     """
     from google.genai import errors
 
     rate_limited = None
+    daily_exhausted = []
     for model in FALLBACK_MODELS:
         try:
             client.models.generate_content(model=model, contents="ok")
             return model  # clean 200 — best choice
         except errors.ClientError as e:
-            if "429" in str(e):
-                print(f"   {model} is rate-limited; will use only if nothing better.")
+            if "429" not in str(e):
+                raise
+            kind = classify_429(e)
+            if kind == "daily":
+                print(f"   {model}: daily free-tier quota exhausted.")
+                daily_exhausted.append(model)
+            else:
+                print(f"   {model} is rate-limited (per-minute); "
+                      "will use only if nothing better.")
                 rate_limited = rate_limited or model
-                continue
-            raise
+            continue
         except errors.ServerError:
             print(f"   {model} is busy (503), trying another...")
             continue
@@ -270,11 +306,23 @@ def pick_available_model(client):
     if rate_limited:
         print(f"   committing to rate-limited {rate_limited}.")
         return rate_limited
+    if daily_exhausted and len(daily_exhausted) == len(FALLBACK_MODELS):
+        raise DailyQuotaExceeded(
+            "All models have hit the free-tier DAILY request limit (20/day "
+            "per model). This resets at midnight Pacific time. To keep going "
+            "now, use a different API key/project or enable billing. See "
+            "https://ai.google.dev/gemini-api/docs/rate-limits"
+        )
     raise RuntimeError("No Gemini model is currently available. Try again shortly.")
 
 
 def generate_with_retry(client, model, contents, config, max_retries=6):
-    """Call one fixed model, retrying the SAME model on transient errors."""
+    """Call one fixed model, retrying the SAME model on transient errors.
+
+    Retries 503 (busy) and per-minute 429 with backoff. A daily-quota 429 is
+    NOT retried — it can't succeed until the quota resets — so we raise a clear
+    DailyQuotaExceeded immediately rather than spamming "model busy".
+    """
     from google.genai import errors
 
     delay = 2
@@ -288,6 +336,13 @@ def generate_with_retry(client, model, contents, config, max_retries=6):
         except errors.ClientError as e:  # 4xx; only 429 is worth retrying
             if "429" not in str(e):
                 raise
+            if classify_429(e) == "daily":
+                raise DailyQuotaExceeded(
+                    f"{model}: free-tier DAILY request limit reached (20/day). "
+                    "Retrying won't help until it resets at midnight Pacific. "
+                    "Use a different API key/project or enable billing to "
+                    "continue now."
+                ) from e
         if attempt == max_retries:
             raise RuntimeError(f"Gemini unavailable after {max_retries} attempts")
         print(f"           (model busy, retrying in {delay}s...)")
@@ -304,6 +359,8 @@ def pursue_goal(client, model, page, contents, config):
     for step in range(1, MAX_STEPS + 1):
         try:
             response = generate_with_retry(client, model, contents, config)
+        except DailyQuotaExceeded:
+            raise  # unrecoverable today: let it end the whole session
         except RuntimeError as e:
             print(f"\n⚠️  {e}. Stopping this goal.")
             return
@@ -413,7 +470,11 @@ def run_agent(first_goal=None, interactive=False):
                   "Type 'quit' (or just Enter) to exit.\n")
             if first_goal:
                 add_goal(first_goal)
-                pursue_goal(client, model, page, contents, config)
+                try:
+                    pursue_goal(client, model, page, contents, config)
+                except DailyQuotaExceeded as e:
+                    print(f"\n⛔ {e}")
+                    return
 
             while True:
                 try:
@@ -424,7 +485,11 @@ def run_agent(first_goal=None, interactive=False):
                 if goal.lower() in ("quit", "exit", "q", ""):
                     break
                 add_goal(goal)
-                pursue_goal(client, model, page, contents, config)
+                try:
+                    pursue_goal(client, model, page, contents, config)
+                except DailyQuotaExceeded as e:
+                    print(f"\n⛔ {e}")
+                    break
         finally:
             browser.close()
 
@@ -453,6 +518,9 @@ if __name__ == "__main__":
         else:
             print(f"GOAL: {goal}\n")
             run_agent(first_goal=goal)
+    except DailyQuotaExceeded as e:
+        print(f"\n⛔ {e}")
+        sys.exit(1)
     except RuntimeError as e:
         print(f"⚠️  {e}")
         sys.exit(1)
