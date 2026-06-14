@@ -57,7 +57,6 @@ terraform apply
 
 ### Connect
 
-Copy `EC2_PUBLIC_IP` from `.env`, then:
 ```bash
 ssh -i ~/.ssh/id_ed25519 ubuntu@35.158.27.184
 ```
