@@ -10,3 +10,8 @@ __pycache__/
 # Playwright
 playwright-report/
 test-results/
+
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
