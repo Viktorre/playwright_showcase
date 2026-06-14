@@ -165,6 +165,22 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "send_email",
+            "description": "Send an email via Gmail. Use when the user asks to email someone.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient email address."},
+                    "subject": {"type": "string", "description": "Email subject line."},
+                    "body": {"type": "string", "description": "The email body text."},
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish",
             "description": "Call when the goal is achieved. Provide a short summary of the result.",
             "parameters": {
@@ -203,6 +219,18 @@ def execute_action(page, name, args):
             loc.press("Enter")
         return f"typed '{args['text']}' into element {args['element_id']}"
 
+    if name == "send_email":
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(args["body"])
+        msg["Subject"] = args["subject"]
+        msg["From"] = os.environ["EMAIL_FROM"]
+        msg["To"] = args["to"]
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(os.environ["EMAIL_FROM"], os.environ["EMAIL_APP_PASSWORD"])
+            server.send_message(msg)
+        return f"sent email to {args['to']} with subject '{args['subject']}'"
+
     return f"unknown action: {name}"
 
 
@@ -210,13 +238,15 @@ def execute_action(page, name, args):
 # DECIDE + the loop tying it all together.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a helpful assistant that can also control a real web browser to accomplish tasks.
+SYSTEM_PROMPT = """You are a helpful assistant that can also control a real web browser and send emails.
 
-You have access to browser tools: navigate, click, type_text, and finish.
+You have access to browser tools: navigate, click, type_text, finish.
+You also have: send_email (sends via Gmail — no browser needed).
 
 RULES:
 - If the user is just chatting (greeting, asking a question, having a conversation), respond with plain text. Do NOT use any tools for casual chat.
 - When the user asks you to do something on the web (e.g. "go to...", "search for...", "open...", "find...", "book...", "log in..."), USE the browser tools immediately. Do not describe what you would do — actually do it by calling the tool.
+- When the user asks to send an email, use send_email directly. Do NOT navigate to Gmail in the browser.
 - When using browser tools, call exactly ONE tool per turn. You will see the updated page after each action.
 - To start a browser task, call navigate() to go to the relevant site.
 - Only reference element ids that appear in the current element list.
