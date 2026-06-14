@@ -78,5 +78,5 @@ output "public_ip" {
 }
 
 output "ssh_command" {
-  value = "ssh -i ~/.ssh/id_ed25519 ec2-user@${aws_instance.agent.public_ip}"
+  value = "ssh -i ~/.ssh/id_ed25519 ubuntu@${aws_instance.agent.public_ip}"
 }

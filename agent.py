@@ -3,14 +3,14 @@ A minimal agentic RPA browser agent.
 
 The core idea is a loop:  OBSERVE -> DECIDE -> ACT -> repeat
   - OBSERVE: read the interactive elements off the page (from the DOM)
-  - DECIDE : send the goal + those elements to Gemini, which picks ONE action
+  - DECIDE : send the goal + those elements to Groq (Llama), which picks ONE action
   - ACT    : Playwright performs that action in a visible browser
-  - repeat until Gemini calls finish()
+  - repeat until the model calls finish()
 
 Run it like:
     ./venv/bin/python agent.py "search trains from Berlin to Munich tomorrow morning"
 
-If you pass no goal, it uses a default bahn.de example.
+If you pass no goal, it uses interactive chat mode.
 """
 
 import os
@@ -19,35 +19,24 @@ import json
 import time
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-MODEL = os.getenv("AGENT_MODEL", "gemini-2.5-flash")
-# If the primary model is overloaded (503), we transparently try the next one.
-# These were all confirmed available on this key's free tier.
-FALLBACK_MODELS = [MODEL, "gemini-flash-latest", "gemini-2.5-flash-lite"]
-# de-duplicate while preserving order, in case MODEL is already in the list
-FALLBACK_MODELS = list(dict.fromkeys(FALLBACK_MODELS))
+MODEL = os.getenv("AGENT_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 MAX_STEPS = 25  # safety cap so the agent can't loop forever
 
 
 # ---------------------------------------------------------------------------
 # OBSERVE: pull the interesting interactive elements out of the live DOM.
-# We label each one with an integer id so the LLM can refer to it simply.
 # ---------------------------------------------------------------------------
 
-# This JS runs inside the page. It walks the DOM, keeps only elements a user
-# could actually interact with and that are visible, and returns a compact
-# description of each (tag, a readable label, and a stable selector).
 COLLECT_ELEMENTS_JS = r"""
 () => {
   const out = [];
   const selector = 'a, button, input, textarea, select, [role=button], [role=link], [role=combobox]';
 
-  // Clear tags from previous observations so ids never collide across turns.
   for (const el of document.querySelectorAll('[data-agent-id]')) {
     el.removeAttribute('data-agent-id');
   }
@@ -63,10 +52,6 @@ COLLECT_ELEMENTS_JS = r"""
 
   let i = 0;
 
-  // Walk a root (document or shadowRoot), recursing into shadow DOM and
-  // same-origin iframes. Many real sites (bahn.de's cookie consent included)
-  // hide their controls inside shadow roots, which a plain querySelectorAll
-  // on `document` would never see.
   const walk = (root) => {
     let nodes;
     try { nodes = root.querySelectorAll(selector); } catch (e) { return; }
@@ -94,7 +79,6 @@ COLLECT_ELEMENTS_JS = r"""
       i++;
     }
 
-    // Recurse into any open shadow roots on this root's elements.
     const all = root.querySelectorAll('*');
     for (const el of all) {
       if (el.shadowRoot) walk(el.shadowRoot);
@@ -103,7 +87,6 @@ COLLECT_ELEMENTS_JS = r"""
 
   walk(document);
 
-  // Same-origin iframes (cross-origin ones will throw and are skipped).
   for (const frame of document.querySelectorAll('iframe')) {
     try {
       if (frame.contentDocument) walk(frame.contentDocument);
@@ -130,66 +113,74 @@ def format_elements(elements):
 
 
 # ---------------------------------------------------------------------------
-# ACT: the set of actions the agent is allowed to take. We declare these to
-# Gemini as "tools" (function calling), so it can only respond with one of
-# these structured actions instead of free-form text.
+# ACT: the set of actions the agent is allowed to take.
+# Declared as OpenAI-compatible tools for Groq.
 # ---------------------------------------------------------------------------
 
 TOOLS = [
-    types.Tool(function_declarations=[
-        types.FunctionDeclaration(
-            name="navigate",
-            description="Navigate the browser to a URL.",
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={"url": types.Schema(type=types.Type.STRING)},
-                required=["url"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="click",
-            description="Click the element with the given id.",
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={"element_id": types.Schema(type=types.Type.INTEGER)},
-                required=["element_id"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="type_text",
-            description="Type text into the input element with the given id.",
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "element_id": types.Schema(type=types.Type.INTEGER),
-                    "text": types.Schema(type=types.Type.STRING),
-                    "submit": types.Schema(
-                        type=types.Type.BOOLEAN,
-                        description="Press Enter after typing. Default false.",
-                    ),
+    {
+        "type": "function",
+        "function": {
+            "name": "navigate",
+            "description": "Navigate the browser to a URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to navigate to."}
                 },
-                required=["element_id", "text"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="finish",
-            description="Call when the goal is achieved. Provide a short summary of the result.",
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={"summary": types.Schema(type=types.Type.STRING)},
-                required=["summary"],
-            ),
-        ),
-    ])
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "click",
+            "description": "Click the element with the given id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "element_id": {"type": "integer", "description": "The id of the element to click."}
+                },
+                "required": ["element_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "type_text",
+            "description": "Type text into the input element with the given id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "element_id": {"type": "integer", "description": "The id of the input element."},
+                    "text": {"type": "string", "description": "The text to type."},
+                    "submit": {"type": "boolean", "description": "Press Enter after typing. Default false."},
+                },
+                "required": ["element_id", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "Call when the goal is achieved. Provide a short summary of the result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "A brief summary of what was accomplished."}
+                },
+                "required": ["summary"],
+            },
+        },
+    },
 ]
 
 
 def element_locator(page, element_id):
-    """Find the live element we tagged during observe().
-
-    `.first` guards against the rare case where a tag lingers in a detached
-    subtree; the freshly tagged, visible element is the one we want.
-    """
+    """Find the live element we tagged during observe()."""
     return page.locator(f"[data-agent-id='{element_id}']").first
 
 
@@ -201,13 +192,13 @@ def execute_action(page, name, args):
 
     if name == "click":
         loc = element_locator(page, args["element_id"])
-        loc.click(timeout=3000)
+        loc.click(timeout=5000)
         return f"clicked element {args['element_id']}"
 
     if name == "type_text":
         loc = element_locator(page, args["element_id"])
-        loc.click(timeout=3000)
-        loc.fill(args["text"], timeout=3000)
+        loc.click(timeout=5000)
+        loc.fill(args["text"], timeout=5000)
         if args.get("submit"):
             loc.press("Enter")
         return f"typed '{args['text']}' into element {args['element_id']}"
@@ -219,174 +210,94 @@ def execute_action(page, name, args):
 # DECIDE + the loop tying it all together.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an RPA agent that controls a real web browser to accomplish a user's goal.
+SYSTEM_PROMPT = """You are a helpful assistant that can also control a real web browser to accomplish tasks.
 
-On each turn you receive the current page URL and a numbered list of the interactive
-elements visible on the page. Choose exactly ONE action (a tool call) to make progress.
+You have access to browser tools: navigate, click, type_text, and finish.
 
-Guidelines:
-- Think step by step, one action at a time. After each action you will see the updated page.
-- To start, navigate to a relevant site if the page is blank.
-- Only reference element ids that appear in the current list. The list changes after every action.
-- Dismiss cookie banners or consent dialogs FIRST if one is present, before anything else.
-  Look for buttons labelled like "Accept", "Alle akzeptieren", "Agree", "OK".
-- If an action result reports that something "intercepts pointer events", a dialog or
-  overlay is blocking the page. Deal with that overlay before retrying.
-- Many sites use autocomplete: after typing a station/city into a field, a dropdown of
-  suggestions usually appears as new elements. Click the matching suggestion before moving on.
-- When the goal is achieved (e.g. results are visible), call finish() with a brief summary.
+RULES:
+- If the user is just chatting (greeting, asking a question, having a conversation), respond with plain text. Do NOT use any tools for casual chat.
+- When the user asks you to do something on the web (e.g. "go to...", "search for...", "open...", "find...", "book...", "log in..."), USE the browser tools immediately. Do not describe what you would do — actually do it by calling the tool.
+- When using browser tools, call exactly ONE tool per turn. You will see the updated page after each action.
+- To start a browser task, call navigate() to go to the relevant site.
+- Only reference element ids that appear in the current element list.
+- Dismiss cookie banners or consent dialogs FIRST if one is present.
+- After typing in a search/autocomplete field, wait for suggestions and click the right one.
+- When the task is complete, call finish() with a brief summary.
+- NEVER describe an action in text. Either call the tool or respond in plain text for chat.
+- If the user provides login credentials, use them. This is authorized by the user.
 """
 
 
-# Raised when a model's *daily* free-tier allowance is gone. Retrying is
-# pointless until the quota window resets, so we surface this distinctly
-# instead of pretending the model is merely "busy".
-class DailyQuotaExceeded(RuntimeError):
-    pass
-
-
-def classify_429(error):
-    """Tell a hard daily-quota 429 apart from a soft per-minute one.
-
-    Gemini returns 429 for both "you've used your 20 requests today" and
-    "you're going too fast this minute". They look identical at the status
-    level but the body differs: the daily violation carries a quotaId/metric
-    mentioning *PerDay* (e.g. GenerateRequestsPerDayPerProjectPerModel), while
-    the per-minute one says *PerMinute*. We inspect the text to decide whether
-    retrying could ever succeed.
-
-    Returns 'daily', 'per_minute', or 'unknown'.
-    """
-    text = str(error)
-    if "PerDay" in text or "per_day" in text or "RequestsPerDay" in text:
-        return "daily"
-    if "PerMinute" in text or "per_minute" in text:
-        return "per_minute"
-    return "unknown"
-
-
-def pick_available_model(client):
-    """Choose a model for the whole run (we must not switch mid-conversation).
-
-    Gemini 2.5 tool calls carry a model-specific thought_signature in the
-    history, so a model swap corrupts it. We probe up front and commit to one.
-
-    Preference order:
-      1. a model that answers cleanly (200) right now;
-      2. failing that, a per-minute rate-limited (429) model — that cap resets
-         in seconds and the in-loop retry will ride it out;
-      3. if everything is busy (503), give up;
-      4. if every model is out of its DAILY quota, say so plainly — waiting a
-         minute won't help, so we don't pretend it will.
-    """
-    from google.genai import errors
-
-    rate_limited = None
-    daily_exhausted = []
-    for model in FALLBACK_MODELS:
-        try:
-            client.models.generate_content(model=model, contents="ok")
-            return model  # clean 200 — best choice
-        except errors.ClientError as e:
-            if "429" not in str(e):
-                raise
-            kind = classify_429(e)
-            if kind == "daily":
-                print(f"   {model}: daily free-tier quota exhausted.")
-                daily_exhausted.append(model)
-            else:
-                print(f"   {model} is rate-limited (per-minute); "
-                      "will use only if nothing better.")
-                rate_limited = rate_limited or model
-            continue
-        except errors.ServerError:
-            print(f"   {model} is busy (503), trying another...")
-            continue
-
-    if rate_limited:
-        print(f"   committing to rate-limited {rate_limited}.")
-        return rate_limited
-    if daily_exhausted and len(daily_exhausted) == len(FALLBACK_MODELS):
-        raise DailyQuotaExceeded(
-            "All models have hit the free-tier DAILY request limit (20/day "
-            "per model). This resets at midnight Pacific time. To keep going "
-            "now, use a different API key/project or enable billing. See "
-            "https://ai.google.dev/gemini-api/docs/rate-limits"
-        )
-    raise RuntimeError("No Gemini model is currently available. Try again shortly.")
-
-
-def generate_with_retry(client, model, contents, config, max_retries=6):
-    """Call one fixed model, retrying the SAME model on transient errors.
-
-    Retries 503 (busy) and per-minute 429 with backoff. A daily-quota 429 is
-    NOT retried — it can't succeed until the quota resets — so we raise a clear
-    DailyQuotaExceeded immediately rather than spamming "model busy".
-    """
-    from google.genai import errors
-
+def generate_with_retry(client, messages, use_tools=True, max_retries=5):
+    """Call Groq with retries on rate-limit (429) or server errors."""
     delay = 2
     for attempt in range(1, max_retries + 1):
         try:
-            return client.models.generate_content(
-                model=model, contents=contents, config=config
+            kwargs = dict(
+                model=MODEL,
+                messages=messages,
+                temperature=0,
             )
-        except errors.ServerError:  # 5xx, e.g. 503 high demand
-            pass
-        except errors.ClientError as e:  # 4xx; only 429 is worth retrying
-            if "429" not in str(e):
+            if use_tools:
+                kwargs["tools"] = TOOLS
+                kwargs["tool_choice"] = "auto"
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            error_str = str(e)
+            # If tool calling fails due to malformed generation, retry without tools
+            if "tool_use_failed" in error_str or "failed_generation" in error_str:
+                if use_tools:
+                    # Retry without tools — model wanted to chat but garbled the format
+                    try:
+                        return client.chat.completions.create(
+                            model=MODEL,
+                            messages=messages,
+                            temperature=0,
+                        )
+                    except Exception:
+                        pass
+                if attempt == max_retries:
+                    raise RuntimeError(f"Groq tool call failed: {error_str}")
+                print(f"           (tool call malformed, retrying in {delay}s...)")
+                time.sleep(delay)
+                delay = min(delay * 2, 10)
+            elif "429" in error_str or "503" in error_str or "500" in error_str:
+                if attempt == max_retries:
+                    raise RuntimeError(f"Groq unavailable after {max_retries} attempts: {error_str}")
+                print(f"           (rate limited, retrying in {delay}s...)")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+            else:
                 raise
-            if classify_429(e) == "daily":
-                raise DailyQuotaExceeded(
-                    f"{model}: free-tier DAILY request limit reached (20/day). "
-                    "Retrying won't help until it resets at midnight Pacific. "
-                    "Use a different API key/project or enable billing to "
-                    "continue now."
-                ) from e
-        if attempt == max_retries:
-            raise RuntimeError(f"Gemini unavailable after {max_retries} attempts")
-        print(f"           (model busy, retrying in {delay}s...)")
-        time.sleep(delay)
-        delay = min(delay * 2, 30)
+    raise RuntimeError("Groq unavailable")
 
 
-def pursue_goal(client, model, page, contents, config):
-    """Run the observe->decide->act loop until the model calls finish().
-
-    Reused for each goal in an interactive session. `page` and `contents` are
-    passed in so the browser state and conversation memory carry over.
-    """
+def pursue_goal(client, page, messages):
+    """Run the observe->decide->act loop until the model calls finish()."""
     for step in range(1, MAX_STEPS + 1):
         try:
-            response = generate_with_retry(client, model, contents, config)
-        except DailyQuotaExceeded:
-            raise  # unrecoverable today: let it end the whole session
+            response = generate_with_retry(client, messages)
         except RuntimeError as e:
             print(f"\n⚠️  {e}. Stopping this goal.")
             return
 
-        candidate = response.candidates[0]
-        contents.append(candidate.content)  # remember what the model said
+        choice = response.choices[0]
+        assistant_message = choice.message
 
-        # Find the tool call in the response.
-        call = None
-        for part in candidate.content.parts:
-            if part.function_call:
-                call = part.function_call
-                break
+        # Append assistant response to conversation history
+        messages.append(assistant_message)
 
-        if call is None:
-            # Model replied with plain text instead of an action; nudge it.
-            text = candidate.content.parts[0].text if candidate.content.parts else ""
-            print(f"[step {step}] model said (no action): {text}")
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part(text="Please respond with a tool call (an action).")],
-            ))
-            continue
+        # Check for tool calls
+        if not assistant_message.tool_calls:
+            # Model replied with plain text — it's chatting, not browsing.
+            text = assistant_message.content or ""
+            print(f"\n{text}")
+            return  # back to the user prompt
 
-        name = call.name
-        args = dict(call.args)
+        # Take the first tool call
+        tool_call = assistant_message.tool_calls[0]
+        name = tool_call.function.name
+        args = json.loads(tool_call.function.arguments)
         print(f"[step {step}] action: {name}({args})")
 
         if name == "finish":
@@ -397,49 +308,55 @@ def pursue_goal(client, model, page, contents, config):
         try:
             result = execute_action(page, name, args)
         except Exception as e:
-            # Keep only the first, useful line of Playwright errors.
             result = f"ERROR performing {name}: {str(e).splitlines()[0]}"
         print(f"           -> {result}")
 
         page.wait_for_timeout(1200)  # let the page settle
 
+        # Wait for navigation to finish if one was triggered
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+
         # OBSERVE the new state and feed it back as the tool result.
+        try:
+            elements = observe(page)
+        except Exception:
+            # Page might still be navigating; wait and retry once
+            page.wait_for_timeout(2000)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            try:
+                elements = observe(page)
+            except Exception:
+                elements = []
         elements = observe(page)
         observation = (
             f"Action result: {result}\n"
             f"Current URL: {page.url}\n"
             f"Interactive elements now on the page:\n{format_elements(elements)}"
         )
-        contents.append(types.Content(
-            role="user",
-            parts=[types.Part.from_function_response(
-                name=name, response={"observation": observation}
-            )],
-        ))
+
+        # Append tool result to conversation
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": observation,
+        })
 
     print("\n⚠️  Reached step limit without finishing.")
 
 
 def run_agent(first_goal=None, interactive=False):
-    """Set up the browser once, then pursue one goal (or chat for many).
-
-    - one-shot:    run_agent("some goal")
-    - interactive: run_agent(interactive=True)  -> asks for goals in a loop,
-                   keeping the same browser and memory between them.
-    """
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    model = pick_available_model(client)
-    print(f"Using model: {model}\n")
-
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        tools=TOOLS,
-        temperature=0,
-        # Disable "thinking": this simple one-action-per-turn loop doesn't
-        # need it, it's faster/cheaper, and crucially it avoids the
-        # thought_signature requirement that breaks model fallback.
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    """Set up the browser once, then pursue one goal (or chat for many)."""
+    client = OpenAI(
+        api_key=os.environ["GROQ_API_KEY"],
+        base_url="https://api.groq.com/openai/v1",
     )
+    print(f"Using model: {MODEL} (via Groq)\n")
 
     with sync_playwright() as p:
         headless = os.getenv("HEADLESS", "true").lower() == "true"
@@ -448,49 +365,42 @@ def run_agent(first_goal=None, interactive=False):
             page = browser.new_page()
             page.set_viewport_size({"width": 1280, "height": 900})
 
-            # One conversation history, reused across goals so the agent
-            # remembers everything it has already done on the page.
-            contents = []
+            # Conversation history
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-            def add_goal(goal):
-                where = "The browser is currently blank." if not page.url or page.url == "about:blank" \
-                    else f"The browser is currently on {page.url}."
-                contents.append(types.Content(
-                    role="user",
-                    parts=[types.Part(text=f"GOAL: {goal}\n\n{where} Begin.")],
-                ))
+            def add_message(text):
+                messages.append({
+                    "role": "user",
+                    "content": text,
+                })
 
             if not interactive:
-                add_goal(first_goal)
-                pursue_goal(client, model, page, contents, config)
-                time.sleep(3)  # let you see the final page
+                where = "The browser is currently blank." if not page.url or page.url == "about:blank" \
+                    else f"The browser is currently on {page.url}."
+                add_message(f"TASK: {first_goal}\n\n{where} Begin.")
+                pursue_goal(client, page, messages)
+                time.sleep(3)
                 return
 
-            # Interactive chat: keep asking for goals until the user quits.
-            print("Interactive mode. Type a goal and watch the browser. "
+            # Interactive chat
+            print("Interactive mode. Type a message or a browser task. "
                   "Type 'quit' (or just Enter) to exit.\n")
             if first_goal:
-                add_goal(first_goal)
-                try:
-                    pursue_goal(client, model, page, contents, config)
-                except DailyQuotaExceeded as e:
-                    print(f"\n⛔ {e}")
-                    return
+                where = "The browser is currently blank." if not page.url or page.url == "about:blank" \
+                    else f"The browser is currently on {page.url}."
+                add_message(f"TASK: {first_goal}\n\n{where} Begin.")
+                pursue_goal(client, page, messages)
 
             while True:
                 try:
-                    goal = input("\nyou> ").strip()
+                    user_input = input("\nyou> ").strip()
                 except (EOFError, KeyboardInterrupt):
                     print()
                     break
-                if goal.lower() in ("quit", "exit", "q", ""):
+                if user_input.lower() in ("quit", "exit", "q", ""):
                     break
-                add_goal(goal)
-                try:
-                    pursue_goal(client, model, page, contents, config)
-                except DailyQuotaExceeded as e:
-                    print(f"\n⛔ {e}")
-                    break
+                add_message(user_input)
+                pursue_goal(client, page, messages)
         finally:
             browser.close()
 
@@ -498,8 +408,6 @@ def run_agent(first_goal=None, interactive=False):
 if __name__ == "__main__":
     args = sys.argv[1:]
 
-    # --chat / -i forces interactive mode. Any remaining args are an optional
-    # first goal. With no args at all, default to interactive.
     interactive = False
     if "--chat" in args:
         interactive = True
@@ -511,7 +419,7 @@ if __name__ == "__main__":
     goal = " ".join(args) if args else None
 
     if goal is None and not interactive:
-        interactive = True  # bare `python agent.py` -> chat
+        interactive = True
 
     try:
         if interactive:
@@ -519,9 +427,6 @@ if __name__ == "__main__":
         else:
             print(f"GOAL: {goal}\n")
             run_agent(first_goal=goal)
-    except DailyQuotaExceeded as e:
-        print(f"\n⛔ {e}")
-        sys.exit(1)
     except RuntimeError as e:
         print(f"⚠️  {e}")
         sys.exit(1)
