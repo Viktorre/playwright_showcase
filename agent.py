@@ -204,6 +204,15 @@ def execute_action(page, name, args):
     """Perform one action with Playwright. Returns a short result string."""
     if name == "navigate":
         page.goto(args["url"], wait_until="domcontentloaded")
+        # Dismiss any cookie/consent overlays via JS
+        page.evaluate("""() => {
+            const selectors = ['#didomi-popup', '#didomi-host', '.didomi-popup-container',
+                               '[id*="consent"]', '[class*="consent"]', '[id*="cookie"]'];
+            for (const s of selectors) {
+                for (const el of document.querySelectorAll(s)) { el.remove(); }
+            }
+        }""")
+        page.wait_for_timeout(500)
         return f"navigated to {args['url']}"
 
     if name == "click":
