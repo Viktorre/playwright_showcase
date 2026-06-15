@@ -57,8 +57,9 @@ terraform apply
 
 ### Connect
 
+Get the IP from `terraform output public_ip`, then:
 ```bash
-ssh -i ~/.ssh/id_ed25519 ubuntu@35.158.27.184
+ssh -i ~/.ssh/id_ed25519 ubuntu@YOUR_EC2_IP
 ```
 
 ### Destroy
@@ -71,6 +72,7 @@ terraform destroy
 
 SSH in (see Connect above), then on the server:
 ```bash
+sudo apt update && sudo apt install -y python3-venv
 git clone https://github.com/Viktorre/playwright_showcase.git
 cd playwright_showcase
 python3 -m venv venv
@@ -78,7 +80,7 @@ python3 -m venv venv
 ./venv/bin/python -m playwright install --with-deps chromium
 ```
 
-Then create `.env` on the server with `HEADLESS=true` and your `GROQ_API_KEY`.
+Then create `.env` on the server with `HEADLESS=true`, your `GROQ_API_KEY`, and email credentials (`EMAIL_FROM`, `EMAIL_APP_PASSWORD`).
 
 ### Scheduled runs (every 12 hours)
 ```bash
