@@ -395,6 +395,22 @@ def run_agent(first_goal=None, interactive=False):
             page = browser.new_page()
             page.set_viewport_size({"width": 1280, "height": 900})
 
+            # Pre-set common cookie consent cookies to avoid banners
+            page.context.add_cookies([
+                {
+                    "name": "didomi_token",
+                    "value": "eyJ1c2VyX2lkIjoiMTllY2QwYzUtZTI5Yi02NzQ5LWFlODMtODc5ZGQxZjJhZmUxIiwiY3JlYXRlZCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsInVwZGF0ZWQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJ2ZXJzaW9uIjoyLCJwdXJwb3NlcyI6eyJlbmFibGVkIjpbImFuYWx5dGljcyIsImZ1bmN0aW9uYWwiLCJtYXJrZXRpbmciXX0sInZlbmRvcnMiOnsiZW5hYmxlZCI6WyJjOmRvY3RvbGliIl19fQ==",
+                    "domain": ".doctolib.de",
+                    "path": "/",
+                },
+                {
+                    "name": "euconsent-v2",
+                    "value": "CPz_HAAPQAAAAOHABAENA_EgAAAAAAAAAAAAAAAA.YAAAAAAAAAAA",
+                    "domain": ".doctolib.de",
+                    "path": "/",
+                },
+            ])
+
             # Conversation history
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
