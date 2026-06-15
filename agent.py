@@ -203,7 +203,17 @@ def element_locator(page, element_id):
 def execute_action(page, name, args):
     """Perform one action with Playwright. Returns a short result string."""
     if name == "navigate":
-        page.goto(args["url"], wait_until="domcontentloaded")
+        # Try navigation up to 3 times if blocked by Cloudflare
+        for attempt in range(3):
+            page.goto(args["url"], wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            body_text = page.inner_text("body")[:200].strip().lower()
+            if "retry later" in body_text or "just a moment" in body_text or body_text == "":
+                if attempt < 2:
+                    page.wait_for_timeout(5000)  # wait before retrying
+                    continue
+                return f"navigated to {args['url']} (WARNING: page may be blocked by bot protection)"
+            break
         # Dismiss any cookie/consent overlays via JS
         page.evaluate("""() => {
             const selectors = ['#didomi-popup', '#didomi-host', '.didomi-popup-container',
