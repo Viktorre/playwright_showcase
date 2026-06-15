@@ -399,13 +399,21 @@ def run_agent(first_goal=None, interactive=False):
 
     with sync_playwright() as p:
         headless = os.getenv("HEADLESS", "true").lower() == "true"
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
         try:
-            page = browser.new_page()
-            page.set_viewport_size({"width": 1280, "height": 900})
-
-            # Pre-set common cookie consent cookies to avoid banners
-            page.context.add_cookies([
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+                locale="de-DE",
+            )
+            # Pre-set cookie consent for Doctolib (Didomi)
+            context.add_cookies([
                 {
                     "name": "didomi_token",
                     "value": "eyJ1c2VyX2lkIjoiMTllY2QwYzUtZTI5Yi02NzQ5LWFlODMtODc5ZGQxZjJhZmUxIiwiY3JlYXRlZCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsInVwZGF0ZWQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJ2ZXJzaW9uIjoyLCJwdXJwb3NlcyI6eyJlbmFibGVkIjpbImFuYWx5dGljcyIsImZ1bmN0aW9uYWwiLCJtYXJrZXRpbmciXX0sInZlbmRvcnMiOnsiZW5hYmxlZCI6WyJjOmRvY3RvbGliIl19fQ==",
@@ -419,6 +427,7 @@ def run_agent(first_goal=None, interactive=False):
                     "path": "/",
                 },
             ])
+            page = context.new_page()
 
             # Conversation history
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
